@@ -1,0 +1,13 @@
+__MACOSX/
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.ipynb_checkpoints/
+data/
+models/
+reports/figures/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
