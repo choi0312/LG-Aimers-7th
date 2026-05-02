@@ -1,13 +1,26 @@
-__MACOSX/
+# Raw data and competition files
+/data/
+*.zip
+*.csv
+*.xlsx
+*.parquet
+*.pkl
+*.joblib
+
+# Outputs
+/outputs/
+/submissions/
+/models/
+
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+.ipynb_checkpoints/
 .venv/
 .env
-.ipynb_checkpoints/
-data/
-models/
-reports/figures/
+
+# OS / IDE
 .DS_Store
-Thumbs.db
 .vscode/
 .idea/
