@@ -1,6 +1,6 @@
-# LG Aimers 7th — 식음업장 메뉴 수요 예측 AI
+# LG AI Research - LG Aimers 7th 
 
-> **LG Aimers 7기 식음업장 메뉴 수요 예측 AI 오프라인 해커톤**  
+> **LG Aimers 7기 식음업장 메뉴 수요 예측 AI 해커톤**  
 > Resort F&B outlet-menu demand forecasting with modular time-series tabular ML
 
 ## Competition Result
@@ -9,7 +9,6 @@
 |---|---|
 | 대회 | LG Aimers 7기 식음업장 메뉴 수요 예측 AI 오프라인 해커톤 |
 | 주최 | **LG AI Research** |
-| 주관 | DACON |
 | 참여/시상 | Hankyung.com |
 | 최종 성과 | **최종 3등 — 한경닷컴 사장상** |
 | 문제 유형 | 정형 시계열 예측, Multi-step Forecasting, Menu-level Demand Forecasting |
@@ -18,12 +17,14 @@
 
 ## 1. 프로젝트 개요
 
-본 레포지토리는 LG Aimers 7기 식음업장 메뉴 수요 예측 해커톤에서 사용한 제출 파이프라인을 포트폴리오용으로 재구성한 버전입니다.  
-원본 노트북 기반의 세 가지 제출 코드, 즉 `Pipeline_1`, `Pipeline_2`, `Median Ensemble`을 하나의 재현 가능한 모듈형 구조로 정리했습니다.
+원본 노트북 기반의 세 가지 제출 코드, `Pipeline_1`, `Pipeline_2`, `Median Ensemble`을 하나의 재현 가능한 모듈형 구조로 정리했습니다.
 
 리조트 F&B 수요는 단순한 일별 판매 추세만으로 설명하기 어렵습니다. 실제 수요는 요일, 주말/공휴일, 객실 판매 실적, 스키장 내장객, 화담숲 방문객, 단체 결제, 날씨, 메뉴별 판매 희소성에 의해 크게 달라집니다. 따라서 본 솔루션은 단일 모델 성능보다 **feature engineering, abnormal demand smoothing, sparse demand handling, robust ensemble**에 중점을 두었습니다.
 
 ## 2. 핵심 접근 방식
+
+<img width="677" height="373" alt="image" src="https://github.com/user-attachments/assets/ceac8bb9-2146-40b5-84bd-5df342a81930" />
+<br>
 
 ### 2.1 Pipeline 1 — Tweedie 기반 기본 시계열 모델
 
@@ -145,14 +146,8 @@ python scripts/median_ensemble.py \
   --out-path outputs/submission_median_ensemble.csv
 ```
 
-## 6. 재현성 관련 메모
 
-현재 레포지토리는 대회 데이터 없이도 코드 구조와 모듈 구성이 확인 가능하도록 정리되어 있습니다.  
-실제 학습/추론 재현을 위해서는 DACON에서 제공된 원본 데이터 파일을 `data/` 경로에 배치해야 합니다.
-
-경로는 모두 상대경로 기반으로 작성되어 있어 Colab, 로컬, GitHub Codespaces 환경에서 동일한 구조로 실행할 수 있습니다.
-
-## 7. Technical Highlights
+## 6. Technical Highlights
 
 - Direct 7-day multi-output forecasting
 - LightGBM Tweedie objective for non-negative skewed demand
@@ -162,6 +157,6 @@ python scripts/median_ensemble.py \
 - Sparse demand guard
 - Median ensemble for robust final submission
 
-## 8. Award
+## 7. Award
 
 본 프로젝트는 **LG AI Research 주최 LG Aimers 7기 오프라인 해커톤에서 최종 3등을 기록하여 한경닷컴 사장상을 수상**했습니다.
