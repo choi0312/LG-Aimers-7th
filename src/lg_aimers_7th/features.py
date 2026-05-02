@@ -1,180 +1,102 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
 
 from .config import DATE_COL, KEY_COL, TARGET_COL, PREDICT_DAYS
+from .preprocess import add_calendar
 
+def add_hwadam_store_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    store = out[KEY_COL].astype(str).str.rsplit("_", n=1).str[0]
+    mask = store.isin({"화담숲주막", "화담숲카페"})
+    for source, new_name in [("hwadam_화담숲", "hw_forest"), ("hwadam_화담채", "hw_chae"), ("hwadam_모노레일", "hw_mono")]:
+        out[new_name] = 0.0
+        if source in out.columns:
+            out.loc[mask, new_name] = pd.to_numeric(out.loc[mask, source], errors="coerce").fillna(0.0)
+    return out
 
-def get_kr_holidays(start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
-    manual = pd.to_datetime([
-        "2023-01-23", "2023-01-24", "2023-03-01", "2023-05-05", "2023-05-29", "2023-06-06", "2023-08-15",
-        "2023-09-28", "2023-09-29", "2023-10-02", "2023-10-03", "2023-10-09", "2023-12-25",
-        "2024-01-01", "2024-02-09", "2024-02-12", "2024-03-01", "2024-04-10", "2024-05-06", "2024-05-15",
-        "2024-06-06", "2024-08-15", "2024-09-16", "2024-09-17", "2024-09-18", "2024-10-01", "2024-10-03", "2024-10-09", "2024-12-25",
-        "2025-01-01", "2025-01-27", "2025-01-28", "2025-01-29", "2025-01-30", "2025-03-03", "2025-05-05", "2025-05-06",
-        "2025-06-03", "2025-06-06", "2025-08-15", "2025-10-03", "2025-10-09", "2025-12-25",
-    ]).normalize()
-
-    try:
-        import holidays
-        years = sorted({date.year for date in pd.date_range(start, end, freq="D")})
-        kr = holidays.KR(years=years)
-        auto = pd.DatetimeIndex([pd.Timestamp(day) for day in kr.keys()]).normalize()
-        holidays_index = pd.DatetimeIndex(sorted(set(manual) | set(auto)))
-    except Exception:
-        holidays_index = pd.DatetimeIndex(sorted(set(manual)))
-
-    return holidays_index[(holidays_index >= start.normalize()) & (holidays_index <= end.normalize())]
-
-
-def add_calendar_features(df: pd.DataFrame, date_col: str = DATE_COL) -> pd.DataFrame:
-    output = df.copy()
-    dates = pd.to_datetime(output[date_col])
-    holidays_index = get_kr_holidays(dates.min() - pd.Timedelta(days=7), dates.max() + pd.Timedelta(days=14))
-
-    output["year"] = dates.dt.year
-    output["month"] = dates.dt.month
-    output["day"] = dates.dt.day
-    output["dayofweek"] = dates.dt.dayofweek
-    output["weekofyear"] = dates.dt.isocalendar().week.astype(int)
-    output["is_weekend"] = (output["dayofweek"] >= 5).astype(int)
-    output["is_holiday"] = dates.dt.normalize().isin(holidays_index).astype(int)
-    output["is_weekend_or_holiday"] = ((output["is_weekend"] == 1) | (output["is_holiday"] == 1)).astype(int)
-    output["is_month_start"] = dates.dt.is_month_start.astype(int)
-    output["is_month_end"] = dates.dt.is_month_end.astype(int)
-    output["sin_dow"] = np.sin(2 * np.pi * output["dayofweek"] / 7)
-    output["cos_dow"] = np.cos(2 * np.pi * output["dayofweek"] / 7)
-    output["sin_month"] = np.sin(2 * np.pi * output["month"] / 12)
-    output["cos_month"] = np.cos(2 * np.pi * output["month"] / 12)
-    return output
-
-
-def make_full_panel(train: pd.DataFrame) -> pd.DataFrame:
-    dates = pd.date_range(train[DATE_COL].min(), train[DATE_COL].max(), freq="D")
-    keys = sorted(train[KEY_COL].unique())
-    panel = pd.MultiIndex.from_product([keys, dates], names=[KEY_COL, DATE_COL]).to_frame(index=False)
-    panel = panel.merge(train, on=[KEY_COL, DATE_COL], how="left")
-    panel[TARGET_COL] = panel[TARGET_COL].fillna(0).clip(lower=0)
-    return panel.sort_values([KEY_COL, DATE_COL]).reset_index(drop=True)
-
+def merge_meta(df: pd.DataFrame, meta: pd.DataFrame, use_hwadam: bool = False) -> pd.DataFrame:
+    out = df.copy()
+    if meta is not None and not meta.empty:
+        out = out.merge(meta, on=DATE_COL, how="left")
+    numeric_cols = [c for c in out.columns if c not in [DATE_COL, KEY_COL]]
+    for c in numeric_cols:
+        if c != TARGET_COL:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    if use_hwadam:
+        out = add_hwadam_store_features(out)
+    return out
 
 def slope(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=float)
-    if len(values) < 2:
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return np.nan
+    x = np.arange(values.size, dtype=float)
+    denom = ((x - x.mean()) ** 2).sum()
+    if denom == 0:
         return 0.0
-    x = np.arange(len(values), dtype=float)
-    y = np.nan_to_num(values, nan=0.0)
-    x = x - x.mean()
-    denom = np.sum(x ** 2)
-    if denom <= 0:
-        return 0.0
-    return float(np.sum(x * (y - y.mean())) / denom)
+    return float(((x - x.mean()) * (values - values.mean())).sum() / denom)
 
+def flag_long_zero_block(group: pd.DataFrame, min_days: int = 14) -> pd.Series:
+    zeros = (group[TARGET_COL] == 0).astype(int)
+    block_id = (zeros != zeros.shift()).cumsum()
+    block_len = zeros.groupby(block_id).transform("sum")
+    return ((zeros == 1) & (block_len >= min_days)).astype(int)
 
-def build_window_features(
-    history: pd.DataFrame,
-    key: str,
-    cutoff: pd.Timestamp,
-    daily_meta: pd.DataFrame,
-    price_map: Dict[str, float],
-    key_encoder_map: Dict[str, int],
-    max_window: int = 28,
-) -> Dict[str, float]:
-    item_history = history[(history[KEY_COL] == key) & (history[DATE_COL] <= cutoff)].sort_values(DATE_COL).tail(max_window)
-    values = item_history[TARGET_COL].to_numpy(dtype=float)
+def build_feature_frame(df: pd.DataFrame, key_to_id: dict[str, int], input_window: int = 35) -> pd.DataFrame:
+    f = df.copy().sort_values([KEY_COL, DATE_COL]).reset_index(drop=True)
+    f = add_calendar(f, DATE_COL)
 
-    if len(values) < max_window:
-        values = np.concatenate([np.zeros(max_window - len(values)), values])
+    for h in range(1, PREDICT_DAYS + 1):
+        future = pd.DataFrame({DATE_COL: f[DATE_COL] + pd.to_timedelta(h, unit="D")})
+        future = add_calendar(future, DATE_COL, prefix=f"h{h}")
+        for c in future.columns:
+            if c != DATE_COL:
+                f[c] = future[c].to_numpy()
 
-    features: Dict[str, float] = {
-        "key_id": float(key_encoder_map.get(key, -1)),
-        "avg_price": float(price_map.get(key, 0.0) if pd.notna(price_map.get(key, 0.0)) else 0.0),
-    }
+    for lag in [1, 2, 3, 4, 5, 6, 7, 14, 21, 27, 28, 35]:
+        f[f"lag_{lag}"] = f.groupby(KEY_COL)[TARGET_COL].shift(lag)
 
-    for lag in [0, 1, 2, 3, 4, 5, 6, 7, 14, 21, 27]:
-        features[f"lag_{lag}"] = float(values[-1 - lag])
+    for window in [7, 14, 21, 28, 35]:
+        shifted = f.groupby(KEY_COL)[TARGET_COL].shift(1)
+        f[f"rolling_mean_{window}"] = shifted.groupby(f[KEY_COL]).rolling(window).mean().reset_index(level=0, drop=True)
+        f[f"rolling_median_{window}"] = shifted.groupby(f[KEY_COL]).rolling(window).median().reset_index(level=0, drop=True)
+        f[f"rolling_std_{window}"] = shifted.groupby(f[KEY_COL]).rolling(window).std().reset_index(level=0, drop=True)
+        f[f"rolling_max_{window}"] = shifted.groupby(f[KEY_COL]).rolling(window).max().reset_index(level=0, drop=True)
+        f[f"zero_ratio_{window}"] = (shifted == 0).groupby(f[KEY_COL]).rolling(window).mean().reset_index(level=0, drop=True)
 
-    for window in [3, 7, 14, 21, 28]:
-        arr = values[-window:]
-        features[f"roll_mean_{window}"] = float(np.mean(arr))
-        features[f"roll_median_{window}"] = float(np.median(arr))
-        features[f"roll_std_{window}"] = float(np.std(arr))
-        features[f"roll_min_{window}"] = float(np.min(arr))
-        features[f"roll_max_{window}"] = float(np.max(arr))
-        features[f"roll_sum_{window}"] = float(np.sum(arr))
-        features[f"zero_ratio_{window}"] = float(np.mean(arr == 0))
-        nonzero = arr[arr > 0]
-        features[f"nonzero_mean_{window}"] = float(np.mean(nonzero)) if len(nonzero) else 0.0
+    f["ratio_mean7_21"] = f["rolling_mean_7"] / f["rolling_mean_21"]
+    f["ratio_mean14_21"] = f["rolling_mean_14"] / f["rolling_mean_21"]
+    f["slope_7"] = f.groupby(KEY_COL)[TARGET_COL].transform(lambda x: x.shift(1).rolling(7).apply(slope, raw=True))
+    f["slope_14"] = f.groupby(KEY_COL)[TARGET_COL].transform(lambda x: x.shift(1).rolling(14).apply(slope, raw=True))
+    f["ewm_mean_7"] = f.groupby(KEY_COL)[TARGET_COL].transform(lambda x: x.shift(1).ewm(span=7, adjust=False, min_periods=2).mean())
+    f["key_encoded"] = f[KEY_COL].astype(str).map(key_to_id).fillna(-1).astype(int)
+    f["row_number_by_key"] = f.groupby(KEY_COL).cumcount()
+    f["is_long_zero_block"] = f.groupby(KEY_COL, sort=False).apply(flag_long_zero_block).reset_index(level=0, drop=True).astype(int)
 
-    for span in [3, 7, 14]:
-        features[f"ewm_{span}"] = float(pd.Series(values).ewm(span=span, adjust=False).mean().iloc[-1])
+    for h in range(1, PREDICT_DAYS + 1):
+        f[f"target_h{h}"] = f.groupby(KEY_COL)[TARGET_COL].shift(-h)
 
-    for window in [7, 14, 28]:
-        features[f"slope_{window}"] = slope(values[-window:])
+    f = f.replace([np.inf, -np.inf], np.nan)
+    return f
 
-    features["last_nonzero_gap"] = float(next((idx for idx, val in enumerate(values[::-1]) if val > 0), max_window))
-    features["all_zero_28"] = float(np.sum(values) == 0)
-    features["positive_days_28"] = float(np.sum(values > 0))
+def make_train_matrix(feature_frame: pd.DataFrame, input_window: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    target_cols = [f"target_h{h}" for h in range(1, PREDICT_DAYS + 1)]
+    drop_cols = [DATE_COL, KEY_COL, TARGET_COL] + target_cols
+    feature_cols = [c for c in feature_frame.columns if c not in drop_cols]
+    train = feature_frame[(feature_frame["row_number_by_key"] >= input_window) & feature_frame[target_cols].notna().all(axis=1)].copy()
+    X = train[feature_cols].fillna(0)
+    y = train[target_cols].fillna(0)
+    return X, y, feature_cols
 
-    cutoff_calendar = add_calendar_features(pd.DataFrame({DATE_COL: [cutoff]}), DATE_COL)
-    for col in cutoff_calendar.columns:
-        if col != DATE_COL:
-            features[f"cutoff_{col}"] = float(cutoff_calendar[col].iloc[0])
-
-    if daily_meta is not None and not daily_meta.empty:
-        meta_row = daily_meta[daily_meta[DATE_COL] <= cutoff].sort_values(DATE_COL).tail(1)
-        if not meta_row.empty:
-            for col in meta_row.columns:
-                if col != DATE_COL:
-                    features[f"meta_last_{col}"] = float(meta_row[col].iloc[0]) if pd.notna(meta_row[col].iloc[0]) else 0.0
-
-    return features
-
-
-def append_horizon_features(features: Dict[str, float], target_date: pd.Timestamp, horizon: int, daily_meta: pd.DataFrame) -> None:
-    calendar = add_calendar_features(pd.DataFrame({DATE_COL: [target_date]}), DATE_COL)
-    for col in calendar.columns:
-        if col != DATE_COL:
-            features[f"h{horizon}_{col}"] = float(calendar[col].iloc[0])
-
-    if daily_meta is not None and not daily_meta.empty:
-        meta_row = daily_meta[daily_meta[DATE_COL] == target_date]
-        if meta_row.empty:
-            meta_row = daily_meta[daily_meta[DATE_COL] <= target_date].sort_values(DATE_COL).tail(1)
-        if not meta_row.empty:
-            for col in meta_row.columns:
-                if col != DATE_COL:
-                    features[f"h{horizon}_meta_{col}"] = float(meta_row[col].iloc[0]) if pd.notna(meta_row[col].iloc[0]) else 0.0
-
-
-def make_supervised_dataset(panel: pd.DataFrame, daily_meta: pd.DataFrame, price: pd.DataFrame, min_cutoff_index: int = 28):
-    keys = sorted(panel[KEY_COL].unique())
-    encoder = LabelEncoder().fit(keys)
-    key_encoder_map = {key: int(value) for key, value in zip(encoder.classes_, encoder.transform(encoder.classes_))}
-    price_map = dict(zip(price[KEY_COL], price["avg_price"])) if not price.empty else {}
-
-    x_rows: List[Dict[str, float]] = []
-    y_rows: List[List[float]] = []
-
-    for key, group in panel.groupby(KEY_COL, sort=False):
-        group = group.sort_values(DATE_COL).reset_index(drop=True)
-        for idx in range(min_cutoff_index - 1, len(group) - PREDICT_DAYS):
-            cutoff = group.loc[idx, DATE_COL]
-            features = build_window_features(panel, key, cutoff, daily_meta, price_map, key_encoder_map)
-            for horizon in range(1, PREDICT_DAYS + 1):
-                append_horizon_features(features, cutoff + pd.Timedelta(days=horizon), horizon, daily_meta)
-            target = group.loc[idx + 1: idx + PREDICT_DAYS, TARGET_COL].to_numpy(dtype=float)
-            if len(target) == PREDICT_DAYS:
-                x_rows.append(features)
-                y_rows.append(target.tolist())
-
-    X = pd.DataFrame(x_rows)
-    Y = pd.DataFrame(y_rows, columns=[f"target_h{horizon}" for horizon in range(1, PREDICT_DAYS + 1)])
-    feature_cols = sorted(X.columns)
-    X = X[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    return X, Y, feature_cols, key_encoder_map, price_map
+def make_test_matrix(feature_frame: pd.DataFrame, test_history: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    cutoff = test_history[DATE_COL].max()
+    rows = feature_frame[feature_frame[DATE_COL] == cutoff].copy()
+    rows = rows.sort_values(KEY_COL)
+    keys = rows[KEY_COL].astype(str).tolist()
+    for col in feature_cols:
+        if col not in rows.columns:
+            rows[col] = 0
+    return rows[feature_cols].fillna(0), keys

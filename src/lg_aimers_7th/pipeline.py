@@ -2,59 +2,30 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .config import DATE_COL, KEY_COL, TARGET_COL, PREDICT_DAYS, PipelineConfig
-from .data_io import (
-    read_csv_robust,
-    find_file,
-    list_test_files,
-    standardize_sales_frame,
-    load_price,
-    build_daily_meta,
-)
-from .features import make_full_panel, make_supervised_dataset, build_window_features, append_horizon_features
-from .modeling import fit_lightgbm_tweedie_ensemble
-from .postprocess import clip_holiday_spikes, postprocess_predictions, build_submission, median_ensemble
+from .config import DATE_COL, KEY_COL, PREDICT_DAYS, ModelConfig
+from .io import find_file, list_test_files, read_csv_robust, standardize_sales_frame, load_price, build_daily_meta
+from .preprocess import weekday_holiday_impute, spike_clamp, apply_room_zero_fix, clamp_max_to_second_by_weekpart
+from .features import merge_meta, build_feature_frame, make_train_matrix, make_test_matrix
+from .model import fit_tweedie_ensemble, predict_ensemble
+from .postprocess import postprocess_prediction, build_submission, median_ensemble
 
+def apply_pipeline_preprocess(sales: pd.DataFrame, meta: pd.DataFrame, config: ModelConfig) -> pd.DataFrame:
+    out = sales.copy()
+    if config.apply_weekday_holiday_impute:
+        out = weekday_holiday_impute(out)
+    if config.apply_spike_clamp:
+        out = spike_clamp(out)
+    if config.apply_room_zero_fix:
+        out = apply_room_zero_fix(out, meta)
+    if config.apply_weekpart_second_clamp:
+        out = clamp_max_to_second_by_weekpart(out)
+    return out
 
-def prepare_test_matrix(
-    data_root: str | Path,
-    test_path: Path,
-    train_panel: pd.DataFrame,
-    feature_cols: List[str],
-    train_daily_meta: pd.DataFrame,
-    price_map: Dict[str, float],
-    key_encoder_map: Dict[str, int],
-) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
-    test_id = test_path.stem
-    test_history = standardize_sales_frame(read_csv_robust(test_path))
-    test_daily_meta = build_daily_meta(data_root, test_id=test_id)
-    daily_meta = pd.concat([train_daily_meta, test_daily_meta], ignore_index=True).drop_duplicates(DATE_COL).sort_values(DATE_COL)
-
-    history = pd.concat([train_panel[[DATE_COL, KEY_COL, TARGET_COL]], test_history], ignore_index=True)
-    keys = sorted(test_history[KEY_COL].unique())
-    cutoff = test_history[DATE_COL].max()
-
-    rows = []
-    for key in keys:
-        features = build_window_features(history, key, cutoff, daily_meta, price_map, key_encoder_map)
-        for horizon in range(1, PREDICT_DAYS + 1):
-            append_horizon_features(features, cutoff + pd.Timedelta(days=horizon), horizon, daily_meta)
-        rows.append(features)
-
-    X_test = pd.DataFrame(rows)
-    for col in feature_cols:
-        if col not in X_test.columns:
-            X_test[col] = 0
-    X_test = X_test[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    return X_test, keys, test_history
-
-
-def run_single_pipeline(data_root: str | Path, output_dir: str | Path, config: PipelineConfig) -> Path:
+def run_single_pipeline(data_root: str | Path, output_dir: str | Path, config: ModelConfig) -> Path:
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -62,77 +33,92 @@ def run_single_pipeline(data_root: str | Path, output_dir: str | Path, config: P
     train_path = find_file(data_root, ["train/train.csv", "train.csv"])
     sample_path = find_file(data_root, ["sample_submission.csv"])
 
-    train = standardize_sales_frame(read_csv_robust(train_path))
-    if config.apply_holiday_spike_clip:
-        train = clip_holiday_spikes(train)
-
-    train_panel = make_full_panel(train)
+    train_raw = standardize_sales_frame(read_csv_robust(train_path))
+    train_meta = build_daily_meta(data_root)
+    train = apply_pipeline_preprocess(train_raw, train_meta, config)
     price = load_price(data_root)
-    train_daily_meta = build_daily_meta(data_root)
 
-    print(f"[{config.name}] train rows={len(train):,}, panel rows={len(train_panel):,}, keys={train_panel[KEY_COL].nunique():,}")
-    X, Y, feature_cols, key_encoder_map, price_map = make_supervised_dataset(train_panel, train_daily_meta, price)
-    print(f"[{config.name}] supervised X={X.shape}, Y={Y.shape}")
+    keys = sorted(train[KEY_COL].unique())
+    key_to_id = {key: i for i, key in enumerate(keys)}
 
-    models = fit_lightgbm_tweedie_ensemble(X, Y, config)
+    train_with_meta = merge_meta(train, train_meta, use_hwadam=config.use_hwadam_features)
+    if not price.empty:
+        train_with_meta = train_with_meta.merge(price, on=KEY_COL, how="left")
 
-    prediction_dict: Dict[str, pd.DataFrame] = {}
+    feature_frame = build_feature_frame(train_with_meta, key_to_id, input_window=config.input_window)
+    X, y, feature_cols = make_train_matrix(feature_frame, input_window=config.input_window)
+
+    print(f"[{config.name}] train={train.shape}, X={X.shape}, y={y.shape}, features={len(feature_cols)}")
+    models = fit_tweedie_ensemble(X, y, config)
+
+    prediction_dict = {}
     for test_path in list_test_files(data_root):
         test_id = test_path.stem
-        X_test, keys, test_history = prepare_test_matrix(
-            data_root=data_root,
-            test_path=test_path,
-            train_panel=train_panel,
-            feature_cols=feature_cols,
-            train_daily_meta=train_daily_meta,
-            price_map=price_map,
-            key_encoder_map=key_encoder_map,
-        )
+        test_raw = standardize_sales_frame(read_csv_robust(test_path))
+        test_meta = build_daily_meta(data_root, test_id=test_id)
+        merged_meta = pd.concat([train_meta, test_meta], ignore_index=True).drop_duplicates(DATE_COL).sort_values(DATE_COL)
+        test = apply_pipeline_preprocess(test_raw, merged_meta, config)
 
-        predictions = [model.predict(X_test) for model in models]
-        prediction = np.mean(predictions, axis=0)
-        prediction = postprocess_predictions(prediction, keys, test_history, config)
-        prediction_dict[test_id] = pd.DataFrame(prediction, index=keys, columns=[f"h{h}" for h in range(1, PREDICT_DAYS + 1)])
-        print(f"[{config.name}] predicted {test_id}: {prediction_dict[test_id].shape}")
+        history = pd.concat([train, test], ignore_index=True)
+        history_with_meta = merge_meta(history, merged_meta, use_hwadam=config.use_hwadam_features)
+        if not price.empty:
+            history_with_meta = history_with_meta.merge(price, on=KEY_COL, how="left")
+
+        test_feature_frame = build_feature_frame(history_with_meta, key_to_id, input_window=config.input_window)
+        X_test, pred_keys = make_test_matrix(test_feature_frame, test, feature_cols)
+        pred = predict_ensemble(models, X_test)
+        pred = postprocess_prediction(pred, pred_keys, test, config)
+
+        prediction_dict[test_id] = pd.DataFrame(
+            pred,
+            index=pred_keys,
+            columns=[f"h{h}" for h in range(1, PREDICT_DAYS + 1)],
+        )
+        print(f"[{config.name}] {test_id}: {prediction_dict[test_id].shape}")
 
     sample = read_csv_robust(sample_path)
     submission = build_submission(sample, prediction_dict)
-    output_path = output_dir / f"submission_{config.name}.csv"
-    submission.to_csv(output_path, index=False, encoding="utf-8-sig")
-    print(f"[{config.name}] saved: {output_path}")
-    return output_path
+    out_path = output_dir / f"submission_{config.name}.csv"
+    submission.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"[{config.name}] saved: {out_path}")
+    return out_path
 
-
-def run_ensemble_pipeline(data_root: str | Path, output_dir: str | Path, n_estimators: int = 1200, use_gpu: bool = False) -> Path:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    config_a = PipelineConfig(
-        name="pipeline_a",
+def default_configs(n_estimators: int = 1200) -> tuple[ModelConfig, ModelConfig]:
+    pipeline_1 = ModelConfig(
+        name="pipeline_1_tweedie_weather_group_ski",
+        input_window=35,
         seed=42,
         n_estimators=n_estimators,
         tweedie_powers=(1.10, 1.30, 1.50),
-        round_threshold=0.13,
-        apply_holiday_spike_clip=True,
-        apply_weekpart_max_clip=False,
-        use_gpu=use_gpu,
+        apply_weekday_holiday_impute=True,
+        apply_spike_clamp=True,
+        apply_room_zero_fix=False,
+        apply_weekpart_second_clamp=False,
+        use_hwadam_features=False,
+        round_threshold=0.130,
     )
-
-    config_b = PipelineConfig(
-        name="pipeline_b",
+    pipeline_2 = ModelConfig(
+        name="pipeline_2_room_hwadam_clamp",
+        input_window=35,
         seed=777,
         n_estimators=n_estimators,
-        learning_rate=0.035,
-        num_leaves=95,
         tweedie_powers=(1.20, 1.40, 1.60),
-        round_threshold=0.18,
-        apply_holiday_spike_clip=True,
-        apply_weekpart_max_clip=True,
-        use_gpu=use_gpu,
+        apply_weekday_holiday_impute=True,
+        apply_spike_clamp=True,
+        apply_room_zero_fix=True,
+        apply_weekpart_second_clamp=True,
+        use_hwadam_features=True,
+        round_threshold=0.130,
     )
+    return pipeline_1, pipeline_2
 
-    path_a = run_single_pipeline(data_root, output_dir, config_a)
-    path_b = run_single_pipeline(data_root, output_dir, config_b)
-    final_path = median_ensemble(path_a, path_b, output_dir / "submission_median_ensemble.csv")
-    print(f"[final] saved: {final_path}")
-    return final_path
+def run_full_pipeline(data_root: str | Path, output_dir: str | Path, n_estimators: int = 1200) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg1, cfg2 = default_configs(n_estimators=n_estimators)
+    path1 = run_single_pipeline(data_root, output_dir, cfg1)
+    path2 = run_single_pipeline(data_root, output_dir, cfg2)
+    final = median_ensemble(path1, path2, output_dir / "submission_median_ensemble.csv")
+    print(f"[final] saved: {final}")
+    return final

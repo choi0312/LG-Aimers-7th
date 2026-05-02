@@ -1,21 +1,18 @@
-# Raw data and competition files
+# raw competition data
 /data/
-*.zip
-*.csv
-*.xlsx
-*.parquet
-*.pkl
-*.joblib
-
-# Outputs
 /outputs/
 /submissions/
 /models/
 
+# large or generated files
+*.zip
+*.parquet
+*.pkl
+*.joblib
+
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 .ipynb_checkpoints/
 .venv/
 .env
