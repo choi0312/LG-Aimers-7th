@@ -1,6 +1,6 @@
 # LG Aimers 7th — Menu Demand Forecasting for F&B Outlets at Gonjiam Resort
 
-> **LG Aimers 7기 식음업장 메뉴 수요 예측 AI 오프라인 해커톤**  
+> **LG Aimers 7기 수요 예측 AI 오프라인 해커톤**  
 > Resort F&B Outlet Menu-level Demand Forecasting with Time-series Tabular Modeling
 
 ## Competition Result
@@ -9,7 +9,6 @@
 |---|---|
 | 대회명 | 식음업장 메뉴 수요 예측 AI 오프라인 해커톤 |
 | 주최 | **LG AI Research** |
-| 주관 | DACON |
 | 참여 | Hankyung.com |
 | 최종 성과 | **최종 3등, 한경닷컴 사장상** |
 | 문제 유형 | 정형 데이터 기반 시계열 수요 예측, Multi-step Forecasting, Menu-level Demand Forecasting |
